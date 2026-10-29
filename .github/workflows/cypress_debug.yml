@@ -1,5 +1,7 @@
-name: Cypress debug
-on: workflow_dispatch
+name: Six-frame visual diagnostics
+on: push
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -78,7 +80,7 @@ jobs:
           http://localhost:8999; do sleep 2; done'
 
       - name: Run tests
-        run: yarn run test:e2e:debug
+        run: yarn build && yarn cypress run --browser chrome --spec cypress/e2e/renderTrack.cy.ts
         working-directory: packages/jbrowse-plugin-apollo
 
       - name: Stop apollo-collaboration-server
@@ -97,5 +99,5 @@ jobs:
         uses: actions/upload-artifact@v7
         if: '!cancelled()'
         with:
-          name: cypress_results
+          name: six-frame-visual-diagnostics
           path: packages/jbrowse-plugin-apollo/cypress
