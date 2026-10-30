@@ -1,0 +1,133 @@
+name: Annotation export error validation
+on:
+  push:
+    branches: [validation/export-dialog-oct30]
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: End-to-end test
+    # MongoDB 8 refuses to start on the ubuntu-24.04 runner's 7.0 kernel. Go
+    # back to ubuntu-latest once MongoDB 8.0.35/8.3.14 are out.
+    # https://github.com/actions/runner-images/issues/15005
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js 24.x
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.14
+          cache: yarn
+
+      - name: Install
+        run: yarn --immutable
+
+      - name: Get latest JBrowse
+        run: yarn run jbrowse create .jbrowse
+        working-directory: packages/jbrowse-plugin-apollo
+
+      - name: Start MongoDB
+        uses: supercharge/mongodb-github-action@1.12.1
+        with:
+          mongodb-version: 8
+          mongodb-replica-set: test-rs
+
+      - name: Start local file server
+        id: file-server
+        background: true
+        # Exits non-zero when it's stopped
+        continue-on-error: true
+        run: exec yarn serve --listen 3131 test/data/
+        working-directory: packages/apollo-collaboration-server
+
+      - name: Start plugin file server
+        id: plugin-server
+        background: true
+        # Exits non-zero when it's stopped
+        continue-on-error: true
+        run: exec yarn start:server
+        working-directory: packages/jbrowse-plugin-apollo
+
+      - name: Start JBrowse file server
+        id: jbrowse-server
+        background: true
+        # Exits non-zero when it's stopped
+        continue-on-error: true
+        run: exec yarn browse
+        working-directory: packages/jbrowse-plugin-apollo
+
+      - name: Start apollo-collaboration-server
+        id: apollo-collaboration-server
+        background: true
+        # Exits non-zero when it's stopped
+        continue-on-error: true
+        # Same as the `cypress:start` script, but without watch and with more
+        # log levels
+        run: exec yarn start:no-watch
+        working-directory: packages/apollo-collaboration-server
+        env:
+          GUEST_USER_ROLE: admin
+          MONGODB_URI: mongodb://localhost:27017/apolloTestDb?directConnection=true
+          LOG_LEVELS: error,warn,log,debug
+
+      # Starting apollo builds shared, so wait for it to finish before the
+      # plugin build (which also builds shared)
+      - name: Wait for servers to start
+        run:
+          timeout 300 bash -c 'until curl -sf http://localhost:3999/health &&
+          curl -sf -o /dev/null http://localhost:9000 && curl -sf -o /dev/null
+          http://localhost:8999; do sleep 2; done'
+
+      - name: Run fixed export tests
+        run: yarn build && yarn cypress run --browser chrome --spec cypress/e2e/downloadGff.cy.ts --config retries=0 --reporter junit --reporter-options mochaFile=fixed-results.xml
+        working-directory: packages/jbrowse-plugin-apollo
+
+      - name: Restore upstream export component for regression check
+        run: git show b5676244b1b1bcee8a220b75d270895fd7823a7f:packages/jbrowse-plugin-apollo/src/components/DownloadGFF3.tsx > packages/jbrowse-plugin-apollo/src/components/DownloadGFF3.tsx
+
+      - name: Run same browser tests on upstream source
+        id: baseline
+        continue-on-error: true
+        run: yarn build && yarn cypress run --browser chrome --spec cypress/e2e/downloadGff.cy.ts --config retries=0 --reporter junit --reporter-options mochaFile=baseline-results.xml
+        working-directory: packages/jbrowse-plugin-apollo
+
+      - name: Verify baseline failure is the export regression
+        run: |
+          python3 - <<'PYTEST'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = ET.parse('packages/jbrowse-plugin-apollo/baseline-results.xml').getroot()
+          cases = list(root.iter('testcase'))
+          failed = [c for c in cases if c.find('failure') is not None]
+          assert len(cases) == 3, [(c.attrib, c.find('failure')) for c in cases]
+          assert len(failed) == 1 and 'Keeps export errors' in failed[0].get('name'), [c.attrib for c in failed]
+          assert 'download-gff3' in ''.join(failed[0].find('failure').itertext())
+          print('Confirmed: new export-error regression fails upstream, both existing export controls pass.')
+          PYTEST
+
+      - name: Stop apollo-collaboration-server
+        cancel: apollo-collaboration-server
+
+      - name: Stop JBrowse file server
+        cancel: jbrowse-server
+
+      - name: Stop plugin file server
+        cancel: plugin-server
+
+      - name: Stop local file server
+        cancel: file-server
+
+      - name: Archive test results
+        uses: actions/upload-artifact@v7
+        if: '!cancelled()'
+        with:
+          name: export-dialog-validation
+          path: |
+            packages/jbrowse-plugin-apollo/cypress/screenshots
+            packages/jbrowse-plugin-apollo/*-results.xml
